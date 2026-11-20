@@ -545,20 +545,42 @@ fn restore_page0(
 ) -> Result<bool, StoreError> {
     if let Some(commit) = parse_commit(first_raw, stem) {
         let mut image = commit.image;
-        let image_len = le_u64(&image[8..16]);
-        if published > image_len {
-            image[8..16].copy_from_slice(&published.to_le_bytes());
-        }
+        let len = recorded_len(best, stem, published, le_u64(&image[8..16]));
+        image[8..16].copy_from_slice(&len.to_le_bytes());
         pwrite_exact(file, path, 0, &image)?;
         return Ok(true);
     }
     if let Some(slot) = best {
         if slot.tail_off[stem] == 0 && slot.tail_len[stem] > 0 {
             pwrite_exact(file, path, 0, image_of(slot, stem))?;
+            if slot.published[stem] > 0 {
+                pwrite_exact(file, path, 8, &slot.published[stem].to_le_bytes())?;
+            }
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn stamp_loaded_len(image: &mut [u8], published: u64) {
+    if published > 0 && image.len() >= 16 {
+        image[8..16].copy_from_slice(&published.to_le_bytes());
+    }
+}
+
+/// A tail slot's length wins over the length bytes inside a page image.
+/// Those bytes can be a later `persist_hwm` that landed during the copy.
+fn recorded_len(best: Option<&TailSlot>, stem: usize, published: u64, image_len: u64) -> u64 {
+    if let Some(slot) = best {
+        if slot.published[stem] > 0 {
+            return slot.published[stem];
+        }
+    }
+    if published > image_len {
+        published
+    } else {
+        image_len
+    }
 }
 
 fn restore_tail_block(
@@ -800,6 +822,13 @@ fn tail_image_buf(
         buf[TAIL_LENS + i * 2..TAIL_LENS + i * 2 + 2].copy_from_slice(&n.to_le_bytes());
     }
     read_tail_images(path, &mut buf, stems, &spans)?;
+    for (i, (published, _, _)) in stems.iter().enumerate() {
+        let (off, n) = spans[i];
+        if off == 0 && n >= 16 {
+            let at = PAGE + i * PAGE;
+            stamp_loaded_len(&mut buf[at..at + n as usize], *published);
+        }
+    }
     let sum = tail_checksum(&buf);
     buf[CHECKSUM_AT..CHECKSUM_END].copy_from_slice(&sum);
     Ok(buf)
@@ -901,6 +930,7 @@ pub(crate) fn write_barrier(
         if n > 0 && all_zero(&image[..n]) {
             continue;
         }
+        stamp_loaded_len(&mut image, specs[i].0);
         images.push((i, image));
     }
     let len = tail

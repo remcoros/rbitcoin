@@ -792,3 +792,73 @@ fn nonzero_tail_is_not_overwritten_by_the_slot() {
     assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `first` names a longer length than the tail slot. Open keeps the slot
+/// length and puts the zeroed tail back.
+#[test]
+fn torn_page0_length_does_not_outrun_the_tail_slot() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let mut tail = vec![0u8; n];
+    read_at(&body, off, &mut tail);
+    let mut page0 = [0u8; PAGE];
+    read_at(&body, 0, &mut page0);
+    let torn = published + 4096;
+    page0[8..16].copy_from_slice(&torn.to_le_bytes());
+    let guard = dir.join("tear_guard");
+    plant_first(&guard.join("first"), TXID_STEM, &page0);
+    plant_tail(
+        &guard.join("tail.0"),
+        4,
+        named,
+        &[(TXID_STEM, published, off, &tail)],
+    );
+    zero_published_tail_block(&body);
+    zero_page0(&body);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.logical_len(), published);
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The page-0 tail image names a longer length than the slot header. Open
+/// writes the slot length over that image.
+#[test]
+fn torn_page0_tail_image_keeps_the_slot_length() {
+    let dir = tmp();
+    let txid = [0x44u8; 32];
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.put_tx_full_batch_indexed(&[coinbase(txid)], false)
+            .unwrap();
+        s.txs.sync_class_a_named(1).unwrap();
+    }
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    assert!(published > 16 && published < 4096, "published {published}");
+    let n = published as usize;
+    let mut image = vec![0u8; n];
+    read_at(&body, 0, &mut image);
+    // Past this page, so the adopted header asks for a tail the slot does not hold.
+    let torn: u64 = 4096 + 32;
+    image[8..16].copy_from_slice(&torn.to_le_bytes());
+    let file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+    file.set_len(torn).unwrap();
+    file.sync_all().unwrap();
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        4,
+        1,
+        &[(TXID_STEM, published, 0, &image)],
+    );
+    std::fs::write(dir.join("tear_guard/first"), vec![0u8; FIRST_BYTES]).unwrap();
+    zero_page0(&body);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.logical_len(), published);
+    assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), txid);
+    let _ = std::fs::remove_dir_all(&dir);
+}

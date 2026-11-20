@@ -854,16 +854,23 @@ fn encode_v2_payload_keeps_a_short_message_on_the_caller() {
     use bitcoin::blockdata::constants::genesis_block;
     use std::time::Duration;
     let hold = ScriptHold::all();
+    // Workers stay held, so an encode that waits on them still expires.
+    // The caller path exceeded 200ms under llvm-cov on the coverage runner.
+    let short_limit = if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(200)
+    };
     let short = poll_until(
         Box::pin(encode_v2_payload(NetworkMessage::Verack)),
-        Duration::from_millis(200),
+        short_limit,
     )
     .unwrap();
     assert_eq!(short, encode_v2_contents(NetworkMessage::Verack).unwrap());
     let one = genesis_block(Network::Regtest).header;
     let headers = poll_until(
         Box::pin(encode_v2_payload(NetworkMessage::Headers(vec![one; 8]))),
-        Duration::from_millis(200),
+        short_limit,
     )
     .unwrap();
     assert_eq!(

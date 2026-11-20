@@ -3592,10 +3592,8 @@ fn assert_spindle_schedule(trace: &[&str], hdd: bool, expect_class_a: bool) {
         .iter()
         .position(|e| *e == "join")
         .unwrap_or_else(|| panic!("missing join: {trace:?}"));
-    if hdd {
-        assert!(ann_end < head, "{trace:?}");
-    } else {
-        assert!(head < ann_end, "{trace:?}");
+    assert!(ann_end < head, "insert follows annotate: {trace:?}");
+    if !hdd {
         assert!(
             !trace.iter().any(|e| *e == "hold" || *e == "release"),
             "{trace:?}"

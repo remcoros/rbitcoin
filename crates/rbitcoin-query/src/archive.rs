@@ -1794,8 +1794,8 @@ impl Query {
     ///
     /// Phase walls go to [`Query::confirm_stats`] (body vs head split).
     ///
-    /// Drains write-behind `tx.head` before return. Confirm write uses
-    /// [`Self::archive_commit_plan_defer_head`] to overlap drain with Class C.
+    /// Drains pending `tx.head` before return. Confirm write leaves that
+    /// insert until after annotate, on the write thread.
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<bool, QueryError> {
         let (committed, _) = self.archive_commit_plan_defer_head(plan)?;
         if committed {

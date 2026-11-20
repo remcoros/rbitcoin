@@ -13,8 +13,7 @@
 //!   both waves are fully claimed.
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC.
-//!   `tx.head` write-behind drain runs on process-wide `ibd-confirm-head`
-//!   (overlap with structural + Class C; not a per-batch spawn).
+//!   The `tx.head` insert runs here after annotate.
 //! ```
 //! IBD pipelines lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2). One Class A appender.
 //!
@@ -45,8 +44,6 @@ use std::time::Instant;
 #[doc(hidden)]
 pub mod bq_resolve;
 #[doc(hidden)]
-pub mod head_drain;
-#[doc(hidden)]
 pub mod index;
 #[doc(hidden)]
 pub mod lookup;
@@ -63,8 +60,6 @@ pub use bq_resolve::{
     confirm_bq_resolve_wave_capped, take_wave_items_for_load, BqResolveWave,
     BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
 };
-#[doc(hidden)]
-pub use head_drain::{submit_head_drain, submit_head_insert, HEAD_DRAIN_THREAD_NAME};
 #[doc(hidden)]
 pub use lookup::{confirm_archive_kind, ConfirmArchiveKind};
 pub use lookup::{

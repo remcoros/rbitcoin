@@ -72,26 +72,29 @@ pub fn hold_spindle(query: &Query) -> SpindleScope<'_> {
     scope
 }
 
-/// `Some` returns that batch. `None` is empty.
-pub fn take_queued_batch(
-    queued: &mut Option<Vec<([u8; 32], rbitcoin_primitives::Fk)>>,
-) -> Vec<([u8; 32], rbitcoin_primitives::Fk)> {
-    queued.take().unwrap_or_default()
-}
-
-#[doc(hidden)]
-pub fn submit_queued<'a>(
-    query: &'a Query,
+/// Insert a taken pending-head batch on this thread.
+///
+/// The open tail is a private slot table. A failed insert puts the batch
+/// back on pending. A later retry is idempotent.
+fn insert_queued(
+    query: &Query,
     queued: Vec<([u8; 32], rbitcoin_primitives::Fk)>,
-) -> super::head_drain::HeadDrainHandle<'a> {
+) -> Result<u64, rbitcoin_store::StoreError> {
     spindle_mark("head");
     let t_head = std::time::Instant::now();
-    let drain = super::head_drain::submit_head_insert(query.store(), queued);
+    let result = query.store().txs.head_insert_queued(&queued);
     let head_sub_ns = t_head.elapsed().as_nanos() as u64;
     if head_sub_ns > 0 {
         crate::note_confirm(&query.confirm_stats().write_head_sub_ns, head_sub_ns);
     }
-    drain
+    spindle_mark("join");
+    match result {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            query.store().txs.head_note_pending(&queued);
+            Err(e)
+        }
+    }
 }
 
 pub fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
@@ -378,16 +381,8 @@ fn write_phase_inner(
         crate::note_confirm(&query.confirm_stats().write_create_map_ns, create_map_ns);
     }
 
-    // Flag off: tx.head insert overlaps structural, Class C, and annotate.
-    // Flag on: the keys stay in this Vec until annotate returns, then insert.
     let queued = query.store().txs.take_pending_queued();
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
-    let mut queued = Some(queued);
-    let early_drain = if query.store().datadir_hdd() {
-        None
-    } else {
-        Some(submit_queued(query, take_queued_batch(&mut queued)))
-    };
 
     let overlap = (|| -> Result<_, ConfirmError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
@@ -480,26 +475,14 @@ fn write_phase_inner(
         ))
     })();
 
-    let drain = if let Some(drain) = early_drain {
-        drain
-    } else {
-        submit_queued(query, take_queued_batch(&mut queued))
-    };
-    spindle_mark("join");
-    let t_join = Instant::now();
-    let (drain_res, restore) = drain.join_restore();
-    let drain_join_ns = t_join.elapsed().as_nanos() as u64;
-    if drain_join_ns > 0 {
-        crate::note_confirm(&query.confirm_stats().write_drain_join_ns, drain_join_ns);
-    }
+    let drain_res = insert_queued(query, queued);
     // The insert ran whether or not the checks below reject: a reject after
     // the Class A append leaves these keys in `tx.head`, and an archived
-    // retry of the same blocks queues none. Note the drain on every joined
-    // insert, or the drain stays behind the fence until a fresh write.
+    // retry of the same blocks queues none. Note the drain on every insert,
+    // or the drain stays behind the fence until a fresh write.
     match (&drain_res, drain_max_fk) {
         (Ok(_), Some(fk)) => query.note_head_drain_fk(fk),
-        (Ok(_), None) => {}
-        (Err(_), _) => query.store().txs.head_note_pending(&restore),
+        (Ok(_), None) | (Err(_), _) => {}
     }
     let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = match overlap {
         Ok(v) => v,
@@ -576,16 +559,7 @@ pub fn finish_post_commit_hashes(
         return Ok(());
     }
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
-    let mut queued = Some(queued);
-    let queued_empty = match queued.as_ref() {
-        Some(batch) => batch.is_empty(),
-        None => true,
-    };
-    let early_drain = if query.store().datadir_hdd() || queued_empty {
-        None
-    } else {
-        Some(submit_queued(query, take_queued_batch(&mut queued)))
-    };
+    let queued_empty = queued.is_empty();
 
     let annotate_res = {
         spindle_mark("ann-begin");
@@ -604,30 +578,15 @@ pub fn finish_post_commit_hashes(
         res
     };
 
-    let drain = if let Some(drain) = early_drain {
-        Some(drain)
-    } else {
-        let batch = take_queued_batch(&mut queued);
-        if batch.is_empty() {
-            None
-        } else {
-            Some(submit_queued(query, batch))
-        }
-    };
-
-    if let Some(drain) = drain {
-        spindle_mark("join");
-        let (drain_res, restore) = drain.join_restore();
-        if drain_res.is_err() {
-            query.store().txs.head_note_pending(&restore);
-        }
+    if queued_empty {
         annotate_res?;
-        drain_res.map_err(ConfirmError::from)?;
-        if let Some(fk) = drain_max_fk {
-            query.note_head_drain_fk(fk);
-        }
-    } else {
-        annotate_res?;
+        return Ok(());
+    }
+    let drain_res = insert_queued(query, queued);
+    annotate_res?;
+    drain_res.map_err(ConfirmError::from)?;
+    if let Some(fk) = drain_max_fk {
+        query.note_head_drain_fk(fk);
     }
     Ok(())
 }

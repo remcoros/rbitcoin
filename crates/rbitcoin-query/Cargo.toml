@@ -34,9 +34,5 @@ skip-flushes = []
 name = "suite"
 path = "tests/suite.rs"
 
-[[test]]
-name = "take_queued_batch"
-path = "tests/take_queued_batch.rs"
-
 [lints]
 workspace = true

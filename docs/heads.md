@@ -63,5 +63,5 @@ sync never sets it. In-page hop keeps 8
 `(depth, fk)` on the stack and spills past that. The open-tail hop reads the private slot table; sealed `g` pages still stream on the ring.
 Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a
 full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is
-&lt;60%. Write inserts via `head_insert_many` on `ibd-confirm-head` (Drain ∥
-Class C). RPC `get_fk_by_txid` hits durable head only until that drain.
+&lt;60%. Write inserts via `head_insert_many` on `ibd-confirm-write` after annotate.
+RPC `get_fk_by_txid` hits durable head only until that insert.

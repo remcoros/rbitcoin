@@ -11,54 +11,6 @@ fn tmp_query() -> (rbitcoin_query::testutil::TempDir, rbitcoin_query::Query) {
     rbitcoin_query::testutil::tiny_query_labeled("write-idemp")
 }
 
-#[test]
-fn tx_head_drain_thread_is_named_and_reused() {
-    use rbitcoin_query::confirm_run::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};
-    let (r1, id1, n1) = submit_head_drain(|| Ok(1)).join_named();
-    let (r2, id2, n2) = submit_head_drain(|| Ok(2)).join_named();
-    assert_eq!(r1.unwrap(), 1);
-    assert_eq!(r2.unwrap(), 2);
-    assert_eq!(n1, HEAD_DRAIN_THREAD_NAME);
-    assert_eq!(n2, HEAD_DRAIN_THREAD_NAME);
-    assert_eq!(id1, id2, "drain must keep one OS thread across batches");
-}
-
-#[test]
-fn head_drain_drop_waits_for_the_worker() {
-    use rbitcoin_query::confirm_run::submit_head_drain;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::Duration;
-
-    let (go_tx, go_rx) = mpsc::channel();
-    let handle = submit_head_drain(move || {
-        let _ = go_rx.recv();
-        Ok(1)
-    });
-    let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        drop(handle);
-        let _ = done_tx.send(());
-    });
-    match done_rx.recv_timeout(Duration::from_millis(400)) {
-        Err(RecvTimeoutError::Timeout) => {}
-        Ok(()) => panic!("drop returned before the worker finished"),
-        Err(e) => panic!("drop waiter disconnected: {e}"),
-    }
-    go_tx.send(()).unwrap();
-    done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("drop finishes once the worker does");
-}
-
-#[test]
-fn head_insert_join_restore_empty_ok() {
-    use rbitcoin_query::confirm_run::submit_head_insert;
-    let (_d, q) = tmp_query();
-    let (r, queued) = submit_head_insert(q.store(), Vec::new()).join_restore();
-    assert_eq!(r.unwrap(), 0);
-    assert!(queued.is_empty());
-}
-
 /// Batch append: contiguous heights merge; gap returns Err(other).
 #[allow(clippy::cognitive_complexity)] // one fixture, many error arms
 #[test]
@@ -3640,7 +3592,7 @@ fn spindle_mark_records_only_while_armed() {
 }
 
 #[test]
-fn datadir_hdd_submits_head_after_annotate() {
+fn head_insert_follows_annotate() {
     use bitcoin::hashes::Hash;
     use rbitcoin_consensus::mine_empty_regtest;
     use rbitcoin_primitives::{Fk, Height};

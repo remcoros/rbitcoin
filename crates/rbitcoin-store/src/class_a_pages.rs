@@ -12,7 +12,6 @@ use crate::io_handle::IoHandle;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
 const PAGE: usize = 4096;
 const STEM_N: usize = 16;
@@ -50,45 +49,6 @@ pub(crate) const STEMS: [&str; STEM_N] = [
     "input.off",
     "input.body",
 ];
-
-static GUARD: Mutex<()> = Mutex::new(());
-
-fn lock_guard() -> MutexGuard<'static, ()> {
-    GUARD.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// `Some` when `bytes` overlaps page 0 or the published partial tail block.
-pub(crate) fn guard_write(
-    published: u64,
-    offset: u64,
-    len: usize,
-) -> Option<MutexGuard<'static, ()>> {
-    if write_overlaps(published, offset, len) {
-        Some(lock_guard())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn lock_pages() -> MutexGuard<'static, ()> {
-    lock_guard()
-}
-
-pub(crate) fn write_overlaps(published: u64, offset: u64, len: usize) -> bool {
-    overlaps_guarded(published, offset, len)
-}
-
-fn overlaps_guarded(published: u64, offset: u64, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let end = offset.saturating_add(len as u64);
-    if offset < PAGE as u64 && end > 0 {
-        return true;
-    }
-    let (block, n) = tail_span(published, u64::MAX);
-    n > 0 && end > block && offset < block + PAGE as u64
-}
 
 fn tail_span(published: u64, file_len: u64) -> (u64, u16) {
     if published == 0 || published.is_multiple_of(PAGE as u64) || published > file_len {
@@ -491,7 +451,6 @@ fn all_zero(bytes: &[u8]) -> bool {
 /// When neither tail slot is usable, write `tail.0` as generation 1 from the
 /// bytes already on disk so a later tear has a synced image.
 pub(crate) fn prepare_and_restore(hot: &Path, seq: &Path) -> Result<(), StoreError> {
-    let _hold = lock_guard();
     migrate_kept(hot, seq)?;
     ensure_guard(hot)?;
     let dir = guard_dir(hot);
@@ -810,6 +769,21 @@ fn write_tail_image(
         file.set_len(TAIL_BYTES)
             .map_err(|e| StoreError::io(path, e))?;
     }
+    let buf = tail_image_buf(path, generation, settled, stems)?;
+    pwrite_exact(file, path, 0, &buf)?;
+    if sync_now {
+        sync_files(&[(path, file)])?;
+    }
+    Ok(())
+}
+
+/// Header plus the tail pages the barrier copies. Does not write the file.
+fn tail_image_buf(
+    path: &Path,
+    generation: u64,
+    settled: u64,
+    stems: &[(u64, u64, Option<IoHandle>)],
+) -> Result<Vec<u8>, StoreError> {
     let mut buf = vec![0u8; TAIL_BYTES as usize];
     buf[0..4].copy_from_slice(CAPT);
     buf[4..6].copy_from_slice(&VERSION.to_le_bytes());
@@ -828,11 +802,7 @@ fn write_tail_image(
     read_tail_images(path, &mut buf, stems, &spans)?;
     let sum = tail_checksum(&buf);
     buf[CHECKSUM_AT..CHECKSUM_END].copy_from_slice(&sum);
-    pwrite_exact(file, path, 0, &buf)?;
-    if sync_now {
-        sync_files(&[(path, file)])?;
-    }
-    Ok(())
+    Ok(buf)
 }
 
 fn read_tail_images(
@@ -883,8 +853,9 @@ fn inactive_slot(slot0: &Option<TailSlot>, slot1: &Option<TailSlot>) -> (u8, u64
 
 /// Copy partial tails into the inactive slot and seal any full page 0 once.
 ///
-/// The mutex covers the read and the side-file pwrite. The stem data sync,
-/// which includes the tail fd, runs after it drops.
+/// One thread appends each stem and stores `published_len` after that
+/// pwrite. This thread reads only up to the length it loaded, then writes
+/// the slot and fsyncs it with those stems. No page lock.
 pub(crate) fn write_barrier(
     hot: &Path,
     files: &[&TableFile; STEM_N],
@@ -904,52 +875,43 @@ pub(crate) fn write_barrier(
     let tail = open_rw(&tail_path)?;
     let first_path = dir.join("first");
     let first_raw = read_fixed(&first_path, FIRST_BYTES)?.unwrap_or_default();
-    let images = {
-        let _hold = lock_guard();
-        let mut specs = Vec::with_capacity(STEM_N);
-        for file in files {
-            let published = file
-                .published_len
-                .load(std::sync::atomic::Ordering::Acquire);
-            let file_len = file
-                .read_file
-                .metadata()
-                .map_err(|e| StoreError::io(file.path(), e))?
-                .len();
-            specs.push((published, file_len, Some(file.io_handle())));
+    let mut specs = Vec::with_capacity(STEM_N);
+    for file in files {
+        let published = file
+            .published_len
+            .load(std::sync::atomic::Ordering::Acquire);
+        let file_len = file
+            .read_file
+            .metadata()
+            .map_err(|e| StoreError::io(file.path(), e))?
+            .len();
+        specs.push((published, file_len, Some(file.io_handle())));
+    }
+    let tail_buf = tail_image_buf(&tail_path, generation, settled, &specs)?;
+    let mut images = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        if parse_commit(&first_raw, i).is_some() || specs[i].0 < PAGE as u64 {
+            continue;
         }
-        write_tail_image(&tail, &tail_path, generation, settled, &specs, false)?;
-        let mut images = Vec::new();
-        for (i, file) in files.iter().enumerate() {
-            if parse_commit(&first_raw, i).is_some() || specs[i].0 < PAGE as u64 {
-                continue;
-            }
-            let mut image = vec![0u8; PAGE];
-            let n = (specs[i].1 as usize).min(PAGE);
-            if n > 0 {
-                pread_exact(&file.read_file, file.path(), 0, &mut image[..n])?;
-            }
-            if n > 0 && all_zero(&image[..n]) {
-                continue;
-            }
-            let at = (i as u64) * 2 * PAGE as u64;
-            let first = open_rw(&first_path)?;
-            pwrite_exact(&first, &first_path, at, &image)?;
-            images.push((i, image));
+        let mut image = vec![0u8; PAGE];
+        let n = (specs[i].1 as usize).min(PAGE);
+        if n > 0 {
+            pread_exact(&file.read_file, file.path(), 0, &mut image[..n])?;
         }
-        images
-    };
+        if n > 0 && all_zero(&image[..n]) {
+            continue;
+        }
+        images.push((i, image));
+    }
+    let len = tail
+        .metadata()
+        .map_err(|e| StoreError::io(&tail_path, e))?
+        .len();
+    if len < TAIL_BYTES {
+        tail.set_len(TAIL_BYTES)
+            .map_err(|e| StoreError::io(&tail_path, e))?;
+    }
+    pwrite_exact(&tail, &tail_path, 0, &tail_buf)?;
     crate::file::TableFile::sync_data_all_with(files, &[(&tail_path, &tail)])?;
-    if images.is_empty() {
-        return Ok(());
-    }
-    let first = open_rw(&first_path)?;
-    sync_files(&[(&first_path, &first)])?;
-    for (stem, image) in &images {
-        let mut commit = vec![0u8; PAGE];
-        fill_commit(&mut commit, *stem, image);
-        let at = (*stem as u64) * 2 * PAGE as u64 + PAGE as u64;
-        pwrite_exact(&first, &first_path, at, &commit)?;
-    }
-    sync_files(&[(first_path.as_path(), &first)])
+    write_seals(&first_path, &images)
 }

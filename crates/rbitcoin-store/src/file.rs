@@ -928,11 +928,6 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        let _pages = crate::class_a_pages::guard_write(
-            self.published_len.load(Ordering::Acquire),
-            offset,
-            bytes.len(),
-        );
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
